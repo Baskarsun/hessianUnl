@@ -16,6 +16,37 @@ training_iter = 2
 noise_rank = 32
 device = 'cpu'
 
+batch_size_forget = 1
+batch_size_retain = 1
+inner_loop_iterations = 2
+conGr_iters = 5
+lam_daR = 0.01      
+eta_outer = 1e-3
+
+
+
+local_path = "/Users/baskar/.cache/huggingface/hub/models--locuslab--tofu_ft_llama2-7b/snapshots/8fa500e8f345f1dd9cfe95bb4689878c944c9cbd"
+tokenizer = AutoTokenizer.from_pretrained(local_path)
+model = AutoModelForCausalLM.from_pretrained(local_path, torch_dtype=torch.float16, low_cpu_mem_usage=True)
+model.eval()
+target_layer = model.model.layers[-1]
+for param in model.parameters():
+    param.requires_grad = False
+
+embed_dim = model.config.hidden_size
+
+
+
+# Variables being optimized
+A = torch.randn(embed_dim, noise_rank, device=device, dtype=torch.float32) * 0.01
+A.requires_grad = True
+phi_f = torch.eye(embed_dim, device=device, dtype=torch.float32, requires_grad=True)
+phi_r = torch.eye(embed_dim, device=device, dtype=torch.float32, requires_grad=True)
+
+def sample_batch(dataset, batch_size):
+    indices = np.random.choice(len(dataset), size=batch_size, replace=False)
+    return dataset.select(indices.tolist())
+
 def make_NoiseandDTransform(phi,zeta):
     def NoiseandDTransform(module, layer_input, layer_output):
         phi_f16 = phi.to(torch.float16)
@@ -35,7 +66,7 @@ def scorewithnoiseandDTransform(model, real_embed, labels, phi, zeta, target_lay
         handle.remove()
     return score
 
-def outer_calculate():
+def outer_calculate(retain_batch):
     Retainstage4_estimate = torch.tensor(0.0, device=device)
     for sample in range(len(retain_batch)):                    
         print(f"Iteration inside retain batch {sample}/{len(retain_batch)}")
@@ -127,7 +158,7 @@ def inner_loop():
         Retainstage4_estimate = Retainstage4_estimate / len(retain_batch)
 
         regterm_phi = lam_da * (phi_f - torch.eye(embed_dim, device=device, dtype=torch.float32)).square().sum()   
-        regterm_sigma = gamma * sigma_current.square().sum()
+        regterm_sigma = gamma * (A @ A.T).square().sum()
         qvalue = Forgetstage4_estimate - alphainner * Retainstage4_estimate - regterm_phi - regterm_sigma
         gradient_phi_f, gradient_A   = torch.autograd.grad(qvalue, [phi_f, A]) 
         with torch.no_grad():   
@@ -137,7 +168,7 @@ def inner_loop():
     return phi_f, A     
 
 
-def computeQvalue():
+def computeQvalue(forget_batch, retain_batch):
     Forgetstage4_estimate = torch.tensor(0.0, device=device)
         
     Retainstage4_estimate = torch.tensor(0.0, device=device)
@@ -193,26 +224,24 @@ def computeQvalue():
     Retainstage4_estimate = Retainstage4_estimate / len(retain_batch)
 
     regterm_phi = lam_da * (phi_f - torch.eye(embed_dim, device=device, dtype=torch.float32)).square().sum()   
-    regterm_sigma = gamma * sigma_current.square().sum()
+    regterm_sigma = gamma * (A @ A.T).square().sum()
     qvalue = Forgetstage4_estimate - alphainner * Retainstage4_estimate - regterm_phi - regterm_sigma
     return qvalue
         
         
 
-def hvp_fn(direction):
-    return hvp_vv(qvalue,vparams,direction)
-
 def flatten(tensors):
-    return torch.cat([t,shape(-1) for t in tensors])
+    return torch.cat([t.reshape(-1) for t in tensors])
 
 def hvp_vv(qvalue,vparams,inverse_hvp):
-    grad_v = torch.autograd.grad(qvalue,vparams,create_graph=True)
+    
+    grad_v = torch.autograd.grad(qvalue, vparams, create_graph=True, retain_graph=True)
     flat_grad = flatten(grad_v)
     grad_dot = torch.dot(flat_grad ,inverse_hvp)
     hessian = torch.autograd.grad(grad_dot,vparams,retain_graph=True)
     return -flatten(hessian)
 
-def conjugate_gradient(outer_grd_wrt_inner,n_iters,tol=1e-6):
+def conjugate_gradient(hvp_fn, outer_grd_wrt_inner, n_iters, tol=1e-6):
     z = torch.zeros_like(outer_grd_wrt_inner)
     r = outer_grd_wrt_inner.clone()
     direction = r.clone()
@@ -230,37 +259,44 @@ def conjugate_gradient(outer_grd_wrt_inner,n_iters,tol=1e-6):
     return z
 
 def hvp_uv(qvalue,phi_r,vparams,inverse_hvp_vector) :
-    grad_v = torch.autograd.grad(qvalue,vparams,create_graph=True)
+    grad_v = torch.autograd.grad(qvalue,vparams,create_graph=True,retain_graph=True)
     flat_grad = flatten(grad_v)
-    grad_dot_inversehvp = tortch.dot(flat_grad,inverse_hvp_vector)
-    indirect_effect_grad = touch.autograd.grad(grad_dot_inversehvp,phi_r,retain_graph=True)[0]
+    grad_dot_inversehvp = torch.dot(flat_grad,inverse_hvp_vector)
+    indirect_effect_grad = torch.autograd.grad(grad_dot_inversehvp,phi_r,retain_graph=True)[0]
     return indirect_effect_grad
 
 
-def outer_loop():
-    phi_f, A = inner_loop()
-    forget_batch = sample_batch(forget_dataset, batch_size_forget)   
+def outer_step():
+    inner_loop()   # updates global phi_f and A in place
+
+    forget_batch = sample_batch(forget_dataset, batch_size_forget)
     retain_batch = sample_batch(retain_dataset, batch_size_retain)
-    qvalue = computeQvalue()
 
-    retain_batch_G = sample_batch(retain_batch,batch_size_retain)
-    gvalue = outercalculate()
+    qvalue = computeQvalue(forget_batch, retain_batch)
+    gvalue = outer_calculate(retain_batch)
     vparams = [phi_f, A]
-    
-    direct_effect_grad = torch.autograd.grad(gvalue,phi_r,retain_graph=True)[0]
-    outer_grd_wrt_inner = flatten(torch.autograd.grad(gvale,vparams,retain_graph=True))
-    
-    inverse_hvp_vector = conjugate_gradient(outer_grd_wrt_inner, n_iters=conGr_iters)
 
-    indirect_effect_grad = hvp_uv(qvalue,phi_r,vparams,inverse_hvp_vector)
+    direct_effect_grad = torch.autograd.grad(gvalue, phi_r, retain_graph=True)[0]
+    #outer_grd_wrt_inner = flatten(torch.autograd.grad(gvalue, vparams, retain_graph=True))
+
+    grads = torch.autograd.grad(gvalue, vparams, retain_graph=True, allow_unused=True)
+    grads = [torch.zeros_like(p) if g is None else g for g, p in zip(grads, vparams)]
+    outer_grd_wrt_inner = flatten(grads)
+
+    hvp = lambda p: hvp_vv(qvalue, vparams, p)
+    inverse_hvp_vector = conjugate_gradient(hvp, outer_grd_wrt_inner, n_iters=conGr_iters)
+
+    indirect_effect_grad = hvp_uv(qvalue, phi_r, vparams, inverse_hvp_vector)
 
     hyper_grad = direct_effect_grad + indirect_effect_grad
-    with torch.nograd():
-        phi_r.add(-eta_outer * hyper_grad)
-    
-    print(f"outer : G = {gvalue.item():.4f}")
+    with torch.no_grad():
+        phi_r.add_(-eta_outer * hyper_grad)   # outer problem is a MIN
 
-    return phi_f,phi_r,A
+    print(f"outer: G = {gvalue.item():.4f}")
+
+
+for t in range(training_iter):
+    outer_step()
 
  
 
