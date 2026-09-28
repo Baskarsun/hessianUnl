@@ -10,10 +10,13 @@ retain_dataset = load_dataset("locuslab/TOFU", "retain99")["train"]
 alpha = 1.0
 gamma = 0.01
 eta = 1e-3
-expectation_simulation = 10
-training_iter = 400
+expectation_simulation = 1
+training_iter = 2
 noise_rank = 32
 device = 'cpu'
+
+batch_size_forget = 1
+batch_size_retain = 1
 
 totalForget = len(forget_dataset)
 totalRetain = len(retain_dataset)
@@ -33,30 +36,27 @@ def sample_batch(dataset, batch_size):
 # The paper has not prescribed how to infuse the noise; this is one way.
 # It may have issues if the tokens have padding.
 
-def scorewithnoise(model,tokenizer,text,zeta,real_embed,forget_batch):
-
-    input_prompt = forget_batch[sample]["question"]
-    output_answer = forget_batch[sample]["answer"] 
-    input_promptIds=tokenizer(input_prompt, return_tensors="pt", truncation=True).to(device) 
-    prompt_len =  input_promptIds["input_ids"].shape[1]
-    labels  = real_embed["input_ids"].clone();
-    labels[:, :prompt_len] = -100 
-    target_layer = model.model.layers[-1]
-    handle = target_layer.register_forward_hook(make_addnoise(zeta)) 
+def scorewithnoise(model, real_embed, labels, zeta, target_layer):
+    handle = target_layer.register_forward_hook(make_addnoise(zeta))
     try:
         outputs = model(**real_embed, labels=labels)
-        score = outputs.loss               
+        score = outputs.loss
     finally:
-        handle.remove()                      
-
+        handle.remove()
     return score
 
 
+local_path = "/Users/baskar/.cache/huggingface/hub/models--locuslab--tofu_ft_llama2-7b/snapshots/8fa500e8f345f1dd9cfe95bb4689878c944c9cbd"
 
-model_name = "locuslab/tofu_ft_llama2-7b"   
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+tokenizer = AutoTokenizer.from_pretrained(local_path)
+model = AutoModelForCausalLM.from_pretrained(local_path, torch_dtype=torch.float16, low_cpu_mem_usage=True)
+
+
+#model_name = "locuslab/tofu_ft_llama2-7b"   
+#tokenizer = AutoTokenizer.from_pretrained(model_name)
+#model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
 model.eval()
+target_layer = model.model.layers[-1]
 
 for param in model.parameters():
     param.requires_grad = False              
@@ -67,27 +67,41 @@ embed_dim = model.config.hidden_size
 
 
     
-A = torch.randn(embed_dim, noise_rank, device=device, requires_grad=True) * 0.01
+A = torch.randn(embed_dim, noise_rank, device=device,dtype=torch.float32) * 0.01
+A.requires_grad = True
 
 
 optimizer = torch.optim.SGD([A], lr=eta)   
 
 for iteration in range(1, training_iter):
-    forget_batch = sample_batch(forget_dataset, totalForget)   
-    retain_batch = sample_batch(retain_dataset, totalRetain)
+    print(f"Iteration {iteration}/{training_iter}")
+    forget_batch = sample_batch(forget_dataset, batch_size_forget)   
+    retain_batch = sample_batch(retain_dataset, batch_size_retain)
 
     Frgetstage1_estimate = torch.tensor(0.0, device=device)
     Retainstage1_estimate = torch.tensor(0.0, device=device)
 
     for sample in range(len(forget_batch)):                    
-        text = forget_batch[sample]["question"] + " " + forget_batch[sample]["answer"]
+        print(f"Iteration inside forget batch {sample}/{len(forget_batch)}")
+        prompt = forget_batch[sample]["question"]
+        text = prompt + " " + forget_batch[sample]["answer"]
+
         real_embed = tokenizer(text, return_tensors="pt", truncation=True).to(device)
+        prompt_ids = tokenizer(prompt, return_tensors="pt", truncation=True).to(device)
+        prompt_len = prompt_ids["input_ids"].shape[1]
+
+        labels = real_embed["input_ids"].clone()
+        labels[:, :prompt_len] = -100
+        #real_embed = tokenizer(text, return_tensors="pt", truncation=True).to(device)
+        
 
         scores = []
         for simulation in range(expectation_simulation):        
-            epsilon = torch.randn(noise_rank, device=device)     
-            zeta = A @ epsilon                                    
-            score = scorewithnoise(model,tokenizer,text,zeta,real_embed,forget_batch)
+            epsilon = torch.randn(noise_rank, device=device,dtype=torch.float32)     
+            #zeta = A @ epsilon  
+            zeta = (A @ epsilon).to(torch.float16)                                  
+            #score = scorewithnoise(model,tokenizer,text,zeta,real_embed,forget_batch)
+            score = scorewithnoise(model, real_embed, labels, zeta, target_layer)
             scores.append(score)
         expectations = torch.stack(scores).mean()
         Frgetstage1_estimate = Frgetstage1_estimate + expectations
@@ -95,21 +109,42 @@ for iteration in range(1, training_iter):
     Frgetstage1_estimate = Frgetstage1_estimate / len(forget_batch)
 
     for sample in range(len(retain_batch)):                    
-            text = retain_batch[sample]["question"] + " " + retain_batch[sample]["answer"]
+            print(f"Iteration inside retain batch {sample}/{len(retain_batch)}")
+            prompt = retain_batch[sample]["question"]
+            text = prompt + " " + retain_batch[sample]["answer"]
+
             real_embed = tokenizer(text, return_tensors="pt", truncation=True).to(device)
-    
+            prompt_ids = tokenizer(prompt, return_tensors="pt", truncation=True).to(device)
+            prompt_len = prompt_ids["input_ids"].shape[1]
+
+            labels = real_embed["input_ids"].clone()
+            labels[:, :prompt_len] = -100
+
+            
             scores = []
             for simulation in range(expectation_simulation):        
-                epsilon = torch.randn(noise_rank, device=device)     
-                zeta = A @ epsilon                                    
-                score = scorewithnoise(model,tokenizer,text,zeta,real_embed,retain_batch)
+                epsilon = torch.randn(noise_rank, device=device,dtype=torch.float32)     
+                #zeta = A @ epsilon  
+                zeta = (A @ epsilon).to(torch.float16)                                    
+                score = scorewithnoise(model, real_embed, labels, zeta, target_layer)
                 scores.append(score)
             expectations = torch.stack(scores).mean()
             Retainstage1_estimate = Retainstage1_estimate + expectations
 
-    Retainstage1_estimate = Retainstage1_estimate / len(forget_batch)        
+    Retainstage1_estimate = Retainstage1_estimate / len(retain_batch) 
+    sigma_current = A @ A.T
+    regterm = gamma * sigma_current.square().sum() 
+    j1value = Frgetstage1_estimate - alpha*Retainstage1_estimate - regterm
     
-            
+    gradient_A = torch.autograd.grad(j1value, A)[0] 
+    with torch.no_grad():
+        A.add_(eta * gradient_A)    
+    
+    # Detach A from the autograd graph and save it to your hard drive
+final_A = A.detach().cpu()
+torch.save(final_A, "stage1_optimized_A.pt")
+
+print("Stage 1 complete! The optimized noise matrix has been saved as 'stage1_optimized_A.pt'")        
 
 
 
